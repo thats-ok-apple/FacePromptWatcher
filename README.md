@@ -1,0 +1,38 @@
+# FacePromptWatcher
+
+一个 macOS 小工具：监测可见的 iPhone 镜像画面，在出现明确的人脸验证提示时发送原生 macOS 通知，提醒本人回到手机前完成认证。
+
+![FacePromptWatcher 图标](Assets/icon-preview.png)
+
+## 功能
+
+- 使用 ScreenCaptureKit 持续采集 iPhone 镜像所在的屏幕区域。
+- 使用本地 Vision OCR 识别“人脸识别”“人脸认证”“本人亲自操作”等明确文案。
+- 连续两帧确认后发送 macOS 系统通知，避免单帧误报。
+- 点击“已处理”后，等待提示页离开再重新布防，避免重复提醒。
+- 所有识别在本机完成；不会代替、绕过或伪造人脸认证。
+
+## 构建与运行
+
+需要 macOS 15 或更高版本，以及 Xcode Command Line Tools。
+
+```zsh
+./build.sh
+open dist/FacePromptWatcher.app
+```
+
+首次运行时，请在 macOS 中允许：
+
+1. `FacePromptWatcher` 的“屏幕与系统音频录制”权限。
+2. `FacePromptWatcher` 的通知权限，并开启“桌面”和“通知中心”。
+3. 若正在使用镜像或共享屏幕，在“系统设置 > 通知”中将“当镜像或共享屏幕时”设为允许通知。
+
+## 重要限制
+
+iPhone 镜像属于受保护的系统画面，直接按窗口采集会得到黑图。因此本项目只能识别已经绘制到 Mac 屏幕上的镜像区域：iPhone 镜像窗口需要位于当前桌面、保持可见且不被遮挡。最小化、切换到其他桌面空间或完全遮挡时，程序无法读取其中的文字。
+
+此外，iPhone 镜像不能与 iPad Sidecar（随航）或 AirPlay 同时使用。普通外接显示器可以作为更适合长期放置镜像窗口的选择。
+
+## 合规说明
+
+本工具仅用于提示用户本人完成认证，请遵守所使用学习平台的规则与要求。

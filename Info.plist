@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>zh_CN</string>
+  <key>CFBundleDisplayName</key>
+  <string>科目一人脸提示提醒</string>
+  <key>CFBundleExecutable</key>
+  <string>FacePromptWatcher</string>
+  <key>CFBundleIconFile</key>
+  <string>FacePromptWatcher</string>
+  <key>CFBundleIdentifier</key>
+  <string>local.codex.FacePromptWatcher</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>FacePromptWatcher</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.1</string>
+  <key>CFBundleVersion</key>
+  <string>3</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>15.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>用于检测 iPhone Mirroring 窗口里是否出现人脸识别提示。</string>
+</dict>
+</plist>
