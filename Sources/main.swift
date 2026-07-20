@@ -18,8 +18,7 @@ struct MonitorConfig: Codable, Equatable {
         windowTerms: [
             "iPhone Mirroring",
             "iPhone 镜像",
-            "iPhone镜像",
-            "iPhone"
+            "iPhone镜像"
         ],
         keywords: [
             "人脸识别",
@@ -48,9 +47,14 @@ private struct MirrorRegion: Equatable {
     let sourceRect: CGRect
     let outputWidth: Int
     let outputHeight: Int
+    let isClippedToDisplay: Bool
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private static let minimumWindowRefreshInterval: TimeInterval = 2
+    private static let maximumWindowRefreshTolerance: TimeInterval = 0.25
+    private static let maximumOCRLongSide = 1100.0
+
     private let config = AppDelegate.loadConfig()
     private let streamQueue = DispatchQueue(label: "local.codex.FacePromptWatcher.capture")
     private let decisiveFaceTerms = [
@@ -75,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var stream: SCStream?
     private var streamReceiver: StreamReceiver?
     private var activeRegion: MirrorRegion?
+    private var regionUpdateGeneration = 0
+    private var occlusionChecks = 0
     private var isMonitoring = false
     private var isRegionOccluded = false
     private var alertActive = false
@@ -87,6 +93,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var alertNotificationSubmitted = false
     private var alertGeneration = 0
     private var activeAlertNotificationID: String?
+    private lazy var textRequest: VNRecognizeTextRequest = {
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["zh-Hans"]
+        request.customWords = decisiveFaceTerms
+        request.minimumTextHeight = 0.015
+        return request
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -222,9 +237,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         settingsButton.isEnabled = false
         updateStatus("正在检测", detail: "正在建立 iPhone 镜像的后台区域流。")
 
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+        let refreshInterval = max(Self.minimumWindowRefreshInterval, config.scanIntervalSeconds)
+        let timer = Timer(timeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.refreshCaptureRegion()
         }
+        timer.tolerance = min(Self.maximumWindowRefreshTolerance, refreshInterval * 0.2)
         trackingTimer = timer
         RunLoop.main.add(timer, forMode: .common)
         refreshCaptureRegion()
@@ -247,8 +264,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func refreshCaptureRegion() {
         guard isMonitoring else { return }
 
-        guard let candidate = findMirrorWindow() else {
+        guard let infoList = onScreenWindowInfo(),
+              let candidate = findMirrorWindow(in: infoList)
+        else {
             isRegionOccluded = false
+            occlusionChecks = 0
             stopCaptureStream()
             if !alertActive {
                 updateStatus("等待镜像窗口", detail: "暂时找不到 iPhone 镜像窗口，正在自动重试。")
@@ -256,15 +276,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
 
-        if isMirrorWindowOccluded(candidate) {
+        if isMirrorWindowOccluded(candidate, in: infoList) {
             isRegionOccluded = true
+            occlusionChecks += 1
+            if occlusionChecks >= 2, activeRegion != nil || stream != nil {
+                stopCaptureStream()
+            }
             if !alertActive {
-                updateStatus("镜像被遮挡", detail: "请让 iPhone 镜像窗口保持可见；遮挡期间会暂停判别，不会错误重置当前提示。")
+                let detail = occlusionChecks >= 2
+                    ? "镜像被遮挡，已暂停采集以节省资源；恢复可见后会自动继续。"
+                    : "请让 iPhone 镜像窗口保持可见；遮挡期间会暂停判别，不会错误重置当前提示。"
+                updateStatus("镜像被遮挡", detail: detail)
             }
             return
         }
 
         isRegionOccluded = false
+        occlusionChecks = 0
         guard let region = makeRegion(for: candidate) else {
             if !alertActive {
                 updateStatus("等待镜像窗口", detail: "无法确定 iPhone 镜像所在显示器，正在自动重试。")
@@ -277,26 +305,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func makeRegion(for candidate: WindowCandidate) -> MirrorRegion? {
-        guard
-            let screen = NSScreen.screens.first(where: { $0.frame.intersects(candidate.bounds) }),
-            let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        else {
+        let matches = NSScreen.screens.compactMap { screen -> (screen: NSScreen, displayID: CGDirectDisplayID, displayBounds: CGRect, intersection: CGRect)? in
+            guard let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+
+            let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+            let displayBounds = CGDisplayBounds(displayID)
+            let intersection = candidate.bounds.intersection(displayBounds)
+            guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
+                return nil
+            }
+            return (screen, displayID, displayBounds, intersection)
+        }
+        guard let match = matches.max(by: { lhs, rhs in
+            lhs.intersection.width * lhs.intersection.height < rhs.intersection.width * rhs.intersection.height
+        }) else {
             return nil
         }
 
+        // kCGWindowBounds and CGDisplayBounds share Quartz global coordinates.
+        let capturedBounds = match.intersection.integral
+        let displayLocalBounds = CGRect(origin: .zero, size: match.displayBounds.size)
         let sourceRect = CGRect(
-            x: candidate.bounds.minX - screen.frame.minX,
-            y: screen.frame.maxY - candidate.bounds.maxY,
-            width: candidate.bounds.width,
-            height: candidate.bounds.height
-        ).integral
-        let scale = screen.backingScaleFactor
+            x: capturedBounds.minX - match.displayBounds.minX,
+            y: capturedBounds.minY - match.displayBounds.minY,
+            width: capturedBounds.width,
+            height: capturedBounds.height
+        ).intersection(displayLocalBounds).integral
+        guard sourceRect.width > 0, sourceRect.height > 0 else {
+            return nil
+        }
+
+        let scale = match.screen.backingScaleFactor
+        let nativeWidth = max(1, Int((sourceRect.width * scale).rounded(.up)))
+        let nativeHeight = max(1, Int((sourceRect.height * scale).rounded(.up)))
+        let outputScale = min(1, Self.maximumOCRLongSide / Double(max(nativeWidth, nativeHeight)))
+        let capturedArea = capturedBounds.width * capturedBounds.height
+        let windowArea = candidate.bounds.width * candidate.bounds.height
         return MirrorRegion(
             candidate: candidate,
-            displayID: CGDirectDisplayID(screenNumber.uint32Value),
+            displayID: match.displayID,
             sourceRect: sourceRect,
-            outputWidth: max(1, Int(sourceRect.width * scale)),
-            outputHeight: max(1, Int(sourceRect.height * scale))
+            outputWidth: max(1, Int((Double(nativeWidth) * outputScale).rounded(.up))),
+            outputHeight: max(1, Int((Double(nativeHeight) * outputScale).rounded(.up))),
+            isClippedToDisplay: capturedArea + 0.5 < windowArea
         )
     }
 
@@ -304,10 +357,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let configuration = streamConfiguration(for: region)
 
         if let stream, activeRegion?.displayID == region.displayID {
+            regionUpdateGeneration += 1
+            let updateGeneration = regionUpdateGeneration
             activeRegion = region
-            stream.updateConfiguration(configuration) { [weak self] error in
-                guard let self, let error else { return }
+            stream.updateConfiguration(configuration) { [weak self, weak stream] error in
+                guard let self, let stream else { return }
                 DispatchQueue.main.async {
+                    guard self.isMonitoring,
+                          self.stream === stream,
+                          self.regionUpdateGeneration == updateGeneration
+                    else {
+                        return
+                    }
+                    guard let error else { return }
                     self.activeRegion = nil
                     self.updateStatus("区域流更新失败", detail: error.localizedDescription)
                 }
@@ -316,10 +378,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         stopCaptureStream()
+        regionUpdateGeneration += 1
+        let launchGeneration = regionUpdateGeneration
         activeRegion = region
         SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) { [weak self] content, error in
             DispatchQueue.main.async {
-                guard let self, self.isMonitoring, self.activeRegion == region else { return }
+                guard let self,
+                      self.isMonitoring,
+                      self.activeRegion == region,
+                      self.regionUpdateGeneration == launchGeneration
+                else {
+                    return
+                }
                 guard let content, error == nil,
                       let display = content.displays.first(where: { $0.displayID == region.displayID })
                 else {
@@ -346,9 +416,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
                 self.stream = stream
                 self.streamReceiver = receiver
-                stream.startCapture { [weak self] error in
-                    guard let self, let error else { return }
+                stream.startCapture { [weak self, weak stream] error in
+                    guard let self, let stream, let error else { return }
                     DispatchQueue.main.async {
+                        guard self.isMonitoring,
+                              self.stream === stream,
+                              self.regionUpdateGeneration == launchGeneration
+                        else {
+                            return
+                        }
                         self.activeRegion = nil
                         self.updateStatus("区域流启动失败", detail: error.localizedDescription)
                     }
@@ -373,15 +449,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func stopCaptureStream() {
-        stream?.stopCapture { _ in }
+        regionUpdateGeneration += 1
+        let streamToStop = stream
         stream = nil
         streamReceiver = nil
         activeRegion = nil
+        streamToStop?.stopCapture { _ in }
         resetPendingConfirmation()
     }
 
-    private func receiveFrame(_ sampleBuffer: CMSampleBuffer, outputType: SCStreamOutputType) {
+    private func receiveFrame(
+        _ sampleBuffer: CMSampleBuffer,
+        outputType: SCStreamOutputType,
+        from stream: SCStream
+    ) {
         guard outputType == .screen,
+              stream === self.stream,
               !isRegionOccluded,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               frameIsComplete(sampleBuffer)
@@ -392,7 +475,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let recognizedText = recognizeText(in: pixelBuffer)
         let source = activeRegion?.candidate.displayName ?? "iPhone 镜像"
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isMonitoring, !self.isRegionOccluded else { return }
+            guard let self,
+                  self.isMonitoring,
+                  self.stream === stream,
+                  !self.isRegionOccluded
+            else {
+                return
+            }
             self.handleScanResult(recognizedText: recognizedText, source: source)
         }
     }
@@ -409,21 +498,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func recognizeText(in pixelBuffer: CVPixelBuffer) -> String {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false
-        request.recognitionLanguages = ["zh-Hans", "en-US"]
+        return autoreleasepool {
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+            do {
+                try handler.perform([textRequest])
+            } catch {
+                return ""
+            }
 
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do {
-            try handler.perform([request])
-        } catch {
-            return ""
+            return textRequest.results?
+                .compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n") ?? ""
         }
-
-        return request.results?
-            .compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: "\n") ?? ""
     }
 
     private func handleScanResult(recognizedText: String, source: String) {
@@ -454,7 +540,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 consecutivePromptMisses = 0
             }
             if !alertActive {
-                updateStatus("正在检测", detail: "已连接：\(source)。还没有看到人脸识别提示。")
+                let scope = activeRegion?.isClippedToDisplay == true
+                    ? "镜像窗口跨屏，当前只识别主要显示器内的可见部分。"
+                    : "已锁定镜像窗口区域。"
+                updateStatus("正在检测", detail: "已连接：\(source)。\(scope) 还没有看到人脸识别提示。")
             }
             return
         }
@@ -531,20 +620,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         updateStatus(message, detail: detail)
     }
 
-    private func findMirrorWindow() -> WindowCandidate? {
-        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-            return nil
-        }
+    private func onScreenWindowInfo() -> [[String: Any]]? {
+        CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+    }
 
+    private func findMirrorWindow(in infoList: [[String: Any]]) -> WindowCandidate? {
         return infoList.compactMap(windowCandidate(from:)).first(where: { candidate in
             let haystack = "\(candidate.ownerName) \(candidate.windowName)"
-            return config.windowTerms.contains { haystack.localizedCaseInsensitiveContains($0) }
+            return config.windowTerms
+                .filter { $0.localizedCaseInsensitiveCompare("iPhone") != .orderedSame }
+                .contains { haystack.localizedCaseInsensitiveContains($0) }
         })
     }
 
-    private func isMirrorWindowOccluded(_ candidate: WindowCandidate) -> Bool {
-        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
-              let targetIndex = infoList.firstIndex(where: { ($0[kCGWindowNumber as String] as? UInt32) == candidate.id })
+    private func isMirrorWindowOccluded(_ candidate: WindowCandidate, in infoList: [[String: Any]]) -> Bool {
+        guard let targetIndex = infoList.firstIndex(where: { ($0[kCGWindowNumber as String] as? UInt32) == candidate.id })
         else {
             return false
         }
@@ -796,12 +886,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-            owner?.receiveFrame(sampleBuffer, outputType: outputType)
+            owner?.receiveFrame(sampleBuffer, outputType: outputType, from: stream)
         }
 
         func stream(_ stream: SCStream, didStopWithError error: Error) {
             DispatchQueue.main.async { [weak owner] in
-                guard let owner, owner.isMonitoring else { return }
+                guard let owner, owner.isMonitoring, owner.stream === stream else { return }
                 owner.activeRegion = nil
                 owner.updateStatus("区域流已停止", detail: error.localizedDescription)
             }
